@@ -1,0 +1,7 @@
+tfstray
+tfstray.exe
+*.tfstate
+*.tfstate.*
+dist/
+*.swp
+.DS_Store

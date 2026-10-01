@@ -1,0 +1,45 @@
+{
+  "version": 4,
+  "terraform_version": "1.0.0",
+  "serial": 1,
+  "lineage": "example",
+  "outputs": {},
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "azurerm_resource_group",
+      "name": "rg_managed",
+      "instances": [
+        {
+          "attributes": {
+            "id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-managed"
+          }
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "azurerm_storage_account",
+      "name": "sa_managed",
+      "instances": [
+        {
+          "attributes": {
+            "id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-managed/providers/Microsoft.Storage/storageAccounts/samanaged"
+          }
+        }
+      ]
+    },
+    {
+      "mode": "data",
+      "type": "azurerm_resource_group",
+      "name": "existing_rg",
+      "instances": [
+        {
+          "attributes": {
+            "id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-existing"
+          }
+        }
+      ]
+    }
+  ]
+}
