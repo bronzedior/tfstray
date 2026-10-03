@@ -68,11 +68,11 @@ Flags:
 	}
 
 	var (
-		subscription    string
-		format          string
-		noDefaults      bool
-		showSuppressed  bool
-		failOn          string
+		subscription   string
+		format         string
+		noDefaults     bool
+		showSuppressed bool
+		failOn         string
 	)
 	var stateFiles, ignorePatterns []string
 
@@ -105,6 +105,19 @@ Flags:
 		return 2
 	}
 
+	managed := make(map[string]bool)
+	for _, stateFile := range stateFiles {
+		m, err := StageB(stateFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stage B failed on %s: %v\n", stateFile, err)
+			return 2
+		}
+		for id := range m {
+			managed[id] = true
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Loaded %d managed resources from state\n", len(managed))
+
 	ctx := context.Background()
 
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
@@ -124,25 +137,12 @@ Flags:
 	httpClient := &http.Client{}
 
 	fmt.Fprintf(os.Stderr, "Scanning subscription %s...\n", subscription)
-	inventory, err := StageA(ctx, httpClient, token.Token, subscription)
+	inventory, err := StageA(ctx, httpClient, resourceGraphURL, token.Token, subscription)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stage A failed: %v\n", err)
 		return 2
 	}
 	fmt.Fprintf(os.Stderr, "Found %d resources in subscription\n", len(inventory))
-
-	managed := make(map[string]bool)
-	for _, stateFile := range stateFiles {
-		m, err := StageB(stateFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "stage B failed on %s: %v\n", stateFile, err)
-			return 2
-		}
-		for id := range m {
-			managed[id] = true
-		}
-	}
-	fmt.Fprintf(os.Stderr, "Loaded %d managed resources from state\n", len(managed))
 
 	unmanaged := StageD(inventory, managed)
 	fmt.Fprintf(os.Stderr, "Found %d unmanaged resources\n", len(unmanaged))
@@ -154,13 +154,7 @@ Flags:
 
 	triaged := StageT(attributed)
 
-	summary := Summary{
-		Scanned:    len(inventory),
-		InState:    len(managed),
-		Unmanaged:  len(unmanaged),
-		Suppressed: len(suppressed),
-		Coverage:   float64(len(managed)) / float64(len(inventory)),
-	}
+	summary := summarize(len(inventory), len(unmanaged), len(suppressed))
 
 	output := Output{
 		SchemaVersion: schemaVersion,
@@ -188,6 +182,19 @@ Flags:
 	}
 
 	return 0
+}
+
+func summarize(scanned, unmanaged, suppressed int) Summary {
+	s := Summary{
+		Scanned:    scanned,
+		InState:    scanned - unmanaged,
+		Unmanaged:  unmanaged,
+		Suppressed: suppressed,
+	}
+	if scanned > 0 {
+		s.Coverage = float64(s.InState) / float64(scanned)
+	}
+	return s
 }
 
 func printText(output Output) {

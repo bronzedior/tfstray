@@ -2,10 +2,12 @@ module github.com/bronzedior/tfstray
 
 go 1.23
 
-require github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.6.0
+require (
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.11.1
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.6.0
+)
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.11.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.8.0 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.2.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
