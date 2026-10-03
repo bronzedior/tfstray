@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -274,44 +277,63 @@ func StageD(inventory []Resource, managed map[string]bool) []Resource {
 	return unmanaged
 }
 
-var defaultDenyList = []struct {
+// suppressRule matches one field ("rg" or "type") for a built-in rule. A user
+// rule has no field and matches resource group, type, or full ID.
+type suppressRule struct {
 	pattern string
 	field   string
-}{
+}
+
+var defaultDenyList = []suppressRule{
 	{"MC_*", "rg"},
 	{"NetworkWatcherRG", "rg"},
 	{"AzureBackupRG_*", "rg"},
 	{"databricks-rg-*", "rg"},
-	{"microsoft.compute/virtualmachinescalesets/*", "type"},
 	{"microsoft.network/networkwatchers", "type"},
 }
 
-func StageS(resources []Resource, ignorePatterns []string, noDefaults bool) ([]Resource, []Resource) {
-	patterns := []struct {
-		pattern string
-		field   string
-	}{}
-
+// suppressionRules returns the built-in rules (unless disabled), then --ignore
+// patterns, then .tfstrayignore lines. A missing ignore file is not an error;
+// a malformed pattern is.
+func suppressionRules(ignore []string, ignoreFile string, noDefaults bool) ([]suppressRule, error) {
+	var rules []suppressRule
 	if !noDefaults {
-		for _, d := range defaultDenyList {
-			patterns = append(patterns, struct {
-				pattern string
-				field   string
-			}{d.pattern, d.field})
+		rules = append(rules, defaultDenyList...)
+	}
+
+	add := func(p, source string) error {
+		if _, err := path.Match(p, ""); err != nil {
+			return fmt.Errorf("%s: bad ignore pattern %q: %w", source, p, err)
+		}
+		rules = append(rules, suppressRule{pattern: p})
+		return nil
+	}
+
+	for _, p := range ignore {
+		if err := add(p, "--ignore"); err != nil {
+			return nil, err
 		}
 	}
-
-	for _, p := range ignorePatterns {
-		patterns = append(patterns, struct {
-			pattern string
-			field   string
-		}{p, ""})
+	data, err := os.ReadFile(ignoreFile)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
 	}
+	for i, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			if err := add(line, fmt.Sprintf("%s:%d", ignoreFile, i+1)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return rules, nil
+}
 
-	var kept, suppressed []Resource
+func StageS(resources []Resource, rules []suppressRule) ([]Resource, []SuppressedResource) {
+	var kept []Resource
+	var suppressed []SuppressedResource
 	for _, res := range resources {
-		if shouldSuppress(res, patterns) {
-			suppressed = append(suppressed, res)
+		if r, ok := matchRule(res, rules); ok {
+			suppressed = append(suppressed, SuppressedResource{Resource: res, Rule: r.pattern, builtIn: r.field != ""})
 		} else {
 			kept = append(kept, res)
 		}
@@ -319,26 +341,31 @@ func StageS(resources []Resource, ignorePatterns []string, noDefaults bool) ([]R
 	return kept, suppressed
 }
 
-func shouldSuppress(res Resource, patterns []struct {
-	pattern string
-	field   string
-}) bool {
-	for _, p := range patterns {
-		pattern := strings.ToLower(p.pattern)
-		rgMatch, _ := filepath.Match(pattern, strings.ToLower(res.ResourceGroup))
-		typeMatch, _ := filepath.Match(pattern, strings.ToLower(res.Type))
-
-		if p.field == "rg" && rgMatch {
-			return true
+// matchRule returns the first matching rule. Matching is case-insensitive, and
+// path.Match keeps * from crossing /.
+func matchRule(res Resource, rules []suppressRule) (suppressRule, bool) {
+	for _, r := range rules {
+		pattern := strings.ToLower(r.pattern)
+		match := func(v string) bool {
+			ok, _ := path.Match(pattern, strings.ToLower(v))
+			return ok
 		}
-		if p.field == "type" && typeMatch {
-			return true
-		}
-		if p.field == "" && (rgMatch || typeMatch) {
-			return true
+		switch r.field {
+		case "rg":
+			if match(res.ResourceGroup) {
+				return r, true
+			}
+		case "type":
+			if match(res.Type) {
+				return r, true
+			}
+		default:
+			if match(res.ResourceGroup) || match(res.Type) || match(res.ID) {
+				return r, true
+			}
 		}
 	}
-	return false
+	return suppressRule{}, false
 }
 
 const attributionWorkers = 8

@@ -62,7 +62,7 @@ Flags:
   -subscription string   Subscription ID (required)
   -state string          State file, directory of *.tfstate, or - for stdin (required, repeatable)
   -format string         Output format: text or json (default "text")
-  -ignore string         Suppress by resource group/type glob (repeatable)
+  -ignore string         Suppress by resource group, type, or full ID glob (repeatable; also read from .tfstrayignore)
   -no-default-ignores    Disable built-in suppression patterns
   -show-suppressed       List suppressed rows
   -max-attribute int     Attribute at most N unmanaged resources, newest first (default 500)
@@ -110,6 +110,11 @@ Flags:
 		return 2
 	}
 	failCrossed, err := parseFailOn(failOn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	rules, err := suppressionRules(ignorePatterns, ".tfstrayignore", noDefaults)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
@@ -169,7 +174,7 @@ Flags:
 	unmanaged := StageD(inventory, managed)
 	fmt.Fprintf(os.Stderr, "Found %d unmanaged resources\n", len(unmanaged))
 
-	kept, suppressed := StageS(unmanaged, ignorePatterns, noDefaults)
+	kept, suppressed := StageS(unmanaged, rules)
 	fmt.Fprintf(os.Stderr, "Suppressed %d resources\n", len(suppressed))
 
 	fmt.Fprintf(os.Stderr, "Attributing %d resources...\n", min(len(kept), maxAttribute))
@@ -181,7 +186,7 @@ Flags:
 
 	triaged := StageT(attributed)
 
-	summary := summarize(len(inventory), len(unmanaged), len(suppressed))
+	summary := summarize(len(inventory), len(unmanaged), suppressed)
 
 	output := Output{
 		SchemaVersion: schemaVersion,
@@ -234,12 +239,19 @@ func parseFailOn(rule string) (func([]UnmanagedResource) bool, error) {
 	}, nil
 }
 
-func summarize(scanned, unmanaged, suppressed int) Summary {
+func summarize(scanned, unmanaged int, suppressed []SuppressedResource) Summary {
 	s := Summary{
 		Scanned:    scanned,
 		InState:    scanned - unmanaged,
 		Unmanaged:  unmanaged,
-		Suppressed: suppressed,
+		Suppressed: SuppressedCount{Total: len(suppressed)},
+	}
+	for _, r := range suppressed {
+		if r.builtIn {
+			s.Suppressed.BuiltIn++
+		} else {
+			s.Suppressed.User++
+		}
 	}
 	if scanned > 0 {
 		s.Coverage = float64(s.InState) / float64(scanned)
@@ -251,7 +263,9 @@ func printText(output Output) {
 	fmt.Printf("Subscription: %s\n", output.Subscription)
 	fmt.Printf("Coverage: %.1f%% (%d in state, %d total)\n",
 		output.Summary.Coverage*100, output.Summary.InState, output.Summary.Scanned)
-	fmt.Printf("Unmanaged: %d (suppressed: %d)\n\n", output.Summary.Unmanaged, output.Summary.Suppressed)
+	sup := output.Summary.Suppressed
+	fmt.Printf("Unmanaged: %d (suppressed: %d (built-in: %d, user rules: %d))\n\n",
+		output.Summary.Unmanaged, sup.Total, sup.BuiltIn, sup.User)
 
 	sections := []struct{ bucket, title string }{
 		{BucketReview, "REVIEW (created by a person)"},
@@ -279,9 +293,9 @@ func printText(output Output) {
 	}
 
 	if len(output.Suppressed) > 0 {
-		fmt.Printf("\nSuppressed (%d):\n", len(output.Suppressed))
+		fmt.Printf("Suppressed (%d):\n", len(output.Suppressed))
 		for _, res := range output.Suppressed {
-			fmt.Printf("  %s\n", res.Name)
+			fmt.Printf("  %s (%s)\n    rule: %s\n", res.Name, res.Type, res.Rule)
 		}
 	}
 }

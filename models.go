@@ -19,20 +19,32 @@ type UnmanagedResource struct {
 	EventTime  *time.Time `json:"event_time,omitempty"`
 }
 
+type SuppressedResource struct {
+	Resource
+	Rule    string `json:"rule"`
+	builtIn bool
+}
+
+type SuppressedCount struct {
+	Total   int `json:"total"`
+	BuiltIn int `json:"built_in"`
+	User    int `json:"user"`
+}
+
 type Summary struct {
-	Scanned    int     `json:"scanned"`
-	InState    int     `json:"in_state"`
-	Unmanaged  int     `json:"unmanaged"`
-	Suppressed int     `json:"suppressed"`
-	Coverage   float64 `json:"coverage"`
+	Scanned    int             `json:"scanned"`
+	InState    int             `json:"in_state"`
+	Unmanaged  int             `json:"unmanaged"`
+	Coverage   float64         `json:"coverage"`
+	Suppressed SuppressedCount `json:"suppressed"`
 }
 
 type Output struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Subscription  string              `json:"subscription"`
-	Summary       Summary             `json:"summary"`
-	Resources     []UnmanagedResource `json:"resources"`
-	Suppressed    []Resource          `json:"suppressed_resources,omitempty"`
+	SchemaVersion int                  `json:"schema_version"`
+	Subscription  string               `json:"subscription"`
+	Summary       Summary              `json:"summary"`
+	Resources     []UnmanagedResource  `json:"resources"`
+	Suppressed    []SuppressedResource `json:"suppressed_resources,omitempty"`
 }
 
 const (
