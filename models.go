@@ -13,10 +13,10 @@ type Resource struct {
 
 type UnmanagedResource struct {
 	Resource
-	Bucket     string    `json:"bucket"`
-	Caller     string    `json:"caller,omitempty"`
-	CallerType string    `json:"caller_type,omitempty"`
-	EventTime  time.Time `json:"event_time,omitempty"`
+	Bucket     string     `json:"bucket"`
+	Caller     string     `json:"caller,omitempty"`
+	CallerType string     `json:"caller_type,omitempty"`
+	EventTime  *time.Time `json:"event_time,omitempty"`
 }
 
 type Summary struct {
@@ -37,7 +37,7 @@ type Output struct {
 
 const (
 	BucketReview         = "REVIEW"
-	BucketLikelyOtherIaC = "LIKELY_OTHER_IaC"
+	BucketLikelyOtherIaC = "LIKELY_OTHER_IAC"
 	BucketUnknown        = "UNKNOWN"
 	BucketNotAttempted   = "NOT_ATTEMPTED"
 )

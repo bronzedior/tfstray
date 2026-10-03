@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -57,13 +59,14 @@ func cmdScan(args []string) int {
 		fmt.Fprintf(os.Stderr, `tfstray scan - list unmanaged resources
 
 Flags:
-  -subscription string    Subscription ID (required)
-  -state string          State file or - for stdin (required, repeatable)
+  -subscription string   Subscription ID (required)
+  -state string          State file, directory of *.tfstate, or - for stdin (required, repeatable)
   -format string         Output format: text or json (default "text")
   -ignore string         Suppress by resource group/type glob (repeatable)
   -no-default-ignores    Disable built-in suppression patterns
   -show-suppressed       List suppressed rows
-  -fail-on string        Exit with 1 if threshold crossed: none|person|any (default "none")
+  -max-attribute int     Attribute at most N unmanaged resources, newest first (default 500)
+  -fail-on string        Exit 1 when crossed: none, any, person, person>N (default "none")
 `)
 	}
 
@@ -73,6 +76,7 @@ Flags:
 		noDefaults     bool
 		showSuppressed bool
 		failOn         string
+		maxAttribute   int
 	)
 	var stateFiles, ignorePatterns []string
 
@@ -81,6 +85,7 @@ Flags:
 	fs.BoolVar(&noDefaults, "no-default-ignores", false, "Disable built-in suppression")
 	fs.BoolVar(&showSuppressed, "show-suppressed", false, "Show suppressed resources")
 	fs.StringVar(&failOn, "fail-on", "none", "Threshold for exit code 1")
+	fs.IntVar(&maxAttribute, "max-attribute", 500, "Attribute at most N unmanaged resources")
 
 	fs.Func("state", "State file or - for stdin (repeatable)", func(s string) error {
 		stateFiles = append(stateFiles, s)
@@ -100,11 +105,29 @@ Flags:
 		fmt.Fprintf(os.Stderr, "error: -subscription is required\n")
 		return 2
 	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(os.Stderr, "error: -format must be text or json, got %q\n", format)
+		return 2
+	}
+	failCrossed, err := parseFailOn(failOn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	if maxAttribute < 0 {
+		fmt.Fprintf(os.Stderr, "error: -max-attribute must be 0 or more\n")
+		return 2
+	}
 	if len(stateFiles) == 0 {
 		fmt.Fprintf(os.Stderr, "error: at least one -state is required\n")
 		return 2
 	}
 
+	stateFiles, err = expandStateInputs(stateFiles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
 	managed := make(map[string]bool)
 	for _, stateFile := range stateFiles {
 		m, err := StageB(stateFile)
@@ -126,18 +149,17 @@ Flags:
 		return 2
 	}
 
-	token, err := cred.GetToken(ctx, policy.TokenRequestOptions{
-		Scopes: []string{"https://management.azure.com/.default"},
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "get token failed: %v\n", err)
-		return 2
+	client := &armClient{
+		http: &http.Client{},
+		base: "https://management.azure.com",
+		token: func(ctx context.Context) (string, error) {
+			t, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://management.azure.com/.default"}})
+			return t.Token, err
+		},
 	}
 
-	httpClient := &http.Client{}
-
 	fmt.Fprintf(os.Stderr, "Scanning subscription %s...\n", subscription)
-	inventory, err := StageA(ctx, httpClient, resourceGraphURL, token.Token, subscription)
+	inventory, err := StageA(ctx, client, subscription)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stage A failed: %v\n", err)
 		return 2
@@ -150,7 +172,12 @@ Flags:
 	kept, suppressed := StageS(unmanaged, ignorePatterns, noDefaults)
 	fmt.Fprintf(os.Stderr, "Suppressed %d resources\n", len(suppressed))
 
-	attributed := StageC(ctx, httpClient, token.Token, subscription, kept)
+	fmt.Fprintf(os.Stderr, "Attributing %d resources...\n", min(len(kept), maxAttribute))
+	attributed, err := StageC(ctx, client, subscription, kept, maxAttribute)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stage C failed: %v\n", err)
+		return 2
+	}
 
 	triaged := StageT(attributed)
 
@@ -173,15 +200,38 @@ Flags:
 		printText(output)
 	}
 
-	if failOn != "none" {
-		for _, res := range triaged {
-			if failOn == "any" || (failOn == "person" && res.CallerType == CallerTypePerson) {
-				return 1
-			}
-		}
+	if failCrossed(triaged) {
+		return 1
 	}
 
 	return 0
+}
+
+func parseFailOn(rule string) (func([]UnmanagedResource) bool, error) {
+	personOnly, max := true, 0
+	switch rule {
+	case "none":
+		return func([]UnmanagedResource) bool { return false }, nil
+	case "any":
+		personOnly = false
+	case "person":
+	default:
+		n, ok := strings.CutPrefix(rule, "person>")
+		v, err := strconv.Atoi(n)
+		if !ok || err != nil || v < 0 {
+			return nil, fmt.Errorf("-fail-on must be none, any, person, or person>N, got %q", rule)
+		}
+		max = v
+	}
+	return func(rows []UnmanagedResource) bool {
+		count := 0
+		for _, r := range rows {
+			if !personOnly || r.Bucket == BucketReview {
+				count++
+			}
+		}
+		return count > max
+	}, nil
 }
 
 func summarize(scanned, unmanaged, suppressed int) Summary {
@@ -203,40 +253,29 @@ func printText(output Output) {
 		output.Summary.Coverage*100, output.Summary.InState, output.Summary.Scanned)
 	fmt.Printf("Unmanaged: %d (suppressed: %d)\n\n", output.Summary.Unmanaged, output.Summary.Suppressed)
 
-	fmt.Println("REVIEW (created by person):")
-	count := 0
-	for _, res := range output.Resources {
-		if res.Bucket == BucketReview {
-			fmt.Printf("  %s (%s)\n    creator: %s\n", res.Name, res.Type, res.Caller)
-			count++
-		}
+	sections := []struct{ bucket, title string }{
+		{BucketReview, "REVIEW (created by a person)"},
+		{BucketLikelyOtherIaC, "LIKELY_OTHER_IAC (created by a service principal or the platform)"},
+		{BucketUnknown, "UNKNOWN (no creation event in the last 90 days)"},
+		{BucketNotAttempted, "NOT_ATTEMPTED (beyond -max-attribute)"},
 	}
-	if count == 0 {
-		fmt.Println("  (none)")
-	}
-
-	fmt.Println("\nLIKELY_OTHER_IaC (created by service principal):")
-	count = 0
-	for _, res := range output.Resources {
-		if res.Bucket == BucketLikelyOtherIaC {
-			fmt.Printf("  %s (%s)\n    creator: %s\n", res.Name, res.Type, res.Caller)
-			count++
-		}
-	}
-	if count == 0 {
-		fmt.Println("  (none)")
-	}
-
-	fmt.Println("\nUNKNOWN (no event found):")
-	count = 0
-	for _, res := range output.Resources {
-		if res.Bucket == BucketUnknown {
+	for _, sec := range sections {
+		fmt.Printf("%s:\n", sec.title)
+		count := 0
+		for _, res := range output.Resources {
+			if res.Bucket != sec.bucket {
+				continue
+			}
 			fmt.Printf("  %s (%s)\n", res.Name, res.Type)
+			if res.Caller != "" {
+				fmt.Printf("    creator: %s\n", res.Caller)
+			}
 			count++
 		}
-	}
-	if count == 0 {
-		fmt.Println("  (none)")
+		if count == 0 {
+			fmt.Println("  (none)")
+		}
+		fmt.Println()
 	}
 
 	if len(output.Suppressed) > 0 {

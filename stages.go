@@ -7,19 +7,85 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
-
-const resourceGraphURL = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"
 
 const inventoryQuery = `resources
 | union (resourcecontainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups')
 | extend resourceGroup = iff(isempty(resourceGroup), name, resourceGroup)
 | project id, type, name, resourceGroup, location, tags`
 
-func StageA(ctx context.Context, httpClient *http.Client, endpoint, token, subscriptionID string) ([]Resource, error) {
+type armClient struct {
+	http  *http.Client
+	base  string
+	token func(context.Context) (string, error)
+}
+
+const maxAttempts = 6
+
+func (c *armClient) do(ctx context.Context, method, target string, body, out any) error {
+	if strings.HasPrefix(target, "/") {
+		target = c.base + target
+	}
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = json.Marshal(body); err != nil {
+			return err
+		}
+	}
+
+	for attempt := 1; ; attempt++ {
+		token, err := c.token(ctx)
+		if err != nil {
+			return fmt.Errorf("get token: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		if retryable && attempt < maxAttempts {
+			wait := time.Second << (attempt - 1)
+			if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+				wait = time.Duration(s) * time.Second
+			}
+			select {
+			case <-time.After(wait):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s returned %d after %d attempts: %s", method, resp.StatusCode, attempt, data)
+		}
+		return json.Unmarshal(data, out)
+	}
+}
+
+func StageA(ctx context.Context, c *armClient, subscriptionID string) ([]Resource, error) {
 	var all []Resource
 	skipToken := ""
 
@@ -28,78 +94,46 @@ func StageA(ctx context.Context, httpClient *http.Client, endpoint, token, subsc
 		if skipToken != "" {
 			options["$skipToken"] = skipToken
 		}
-		body, err := json.Marshal(map[string]any{
+		var result struct {
+			Data []struct {
+				ID            string            `json:"id"`
+				Type          string            `json:"type"`
+				Name          string            `json:"name"`
+				ResourceGroup string            `json:"resourceGroup"`
+				Location      string            `json:"location"`
+				Tags          map[string]string `json:"tags"`
+			} `json:"data"`
+			SkipToken       string `json:"$skipToken"`
+			ResultTruncated string `json:"resultTruncated"`
+		}
+		err := c.do(ctx, "POST", "/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01", map[string]any{
 			"subscriptions": []string{subscriptionID},
 			"query":         inventoryQuery,
 			"options":       options,
-		})
+		}, &result)
 		if err != nil {
-			return nil, fmt.Errorf("marshal query: %w", err)
+			return nil, fmt.Errorf("resource graph: %w", err)
+		}
+		if result.ResultTruncated == "true" {
+			return nil, fmt.Errorf("resource graph truncated the inventory and offered no page token")
 		}
 
-		page, next, err := fetchInventoryPage(ctx, httpClient, endpoint, token, body)
-		if err != nil {
-			return nil, err
+		for _, r := range result.Data {
+			all = append(all, Resource{
+				ID:            r.ID,
+				Type:          strings.ToLower(r.Type),
+				Name:          r.Name,
+				ResourceGroup: r.ResourceGroup,
+				Location:      r.Location,
+				Tags:          r.Tags,
+			})
 		}
-		all = append(all, page...)
 
-		if next == "" {
+		if result.SkipToken == "" {
 			return all, nil
 		}
-		skipToken = next
+		skipToken = result.SkipToken
 	}
-}
-
-func fetchInventoryPage(ctx context.Context, httpClient *http.Client, endpoint, token string, body []byte) ([]Resource, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, "", fmt.Errorf("build resource graph request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("resource graph request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("resource graph returned %d: %s", resp.StatusCode, string(data))
-	}
-
-	var result struct {
-		Data []struct {
-			ID            string            `json:"id"`
-			Type          string            `json:"type"`
-			Name          string            `json:"name"`
-			ResourceGroup string            `json:"resourceGroup"`
-			Location      string            `json:"location"`
-			Tags          map[string]string `json:"tags"`
-		} `json:"data"`
-		SkipToken       string `json:"$skipToken"`
-		ResultTruncated string `json:"resultTruncated"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, "", fmt.Errorf("decode resource graph response: %w", err)
-	}
-	if result.ResultTruncated == "true" {
-		return nil, "", fmt.Errorf("resource graph truncated the inventory and offered no page token")
-	}
-
-	page := make([]Resource, 0, len(result.Data))
-	for _, r := range result.Data {
-		page = append(page, Resource{
-			ID:            r.ID,
-			Type:          strings.ToLower(r.Type),
-			Name:          r.Name,
-			ResourceGroup: r.ResourceGroup,
-			Location:      r.Location,
-			Tags:          r.Tags,
-		})
-	}
-	return page, result.SkipToken, nil
 }
 
 type tfState struct {
@@ -129,6 +163,39 @@ type showModule struct {
 		} `json:"values"`
 	} `json:"resources"`
 	ChildModules []showModule `json:"child_modules"`
+}
+
+func expandStateInputs(inputs []string) ([]string, error) {
+	var files []string
+	for _, in := range inputs {
+		if in == "-" {
+			if slices.Contains(files, "-") {
+				return nil, fmt.Errorf("- may appear at most once; stdin holds one document")
+			}
+			files = append(files, in)
+			continue
+		}
+		info, err := os.Stat(in)
+		if err != nil || !info.IsDir() {
+			files = append(files, in)
+			continue
+		}
+		entries, err := os.ReadDir(in)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".tfstate") {
+				files = append(files, filepath.Join(in, e.Name()))
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%s: no *.tfstate files in directory", in)
+		}
+	}
+	return files, nil
 }
 
 func StageB(stateInput string) (map[string]bool, error) {
@@ -274,35 +341,142 @@ func shouldSuppress(res Resource, patterns []struct {
 	return false
 }
 
-func StageC(ctx context.Context, httpClient *http.Client, token, subscriptionID string, resources []Resource) []UnmanagedResource {
-	var result []UnmanagedResource
-	for _, res := range resources {
-		um := UnmanagedResource{
-			Resource:   res,
-			Bucket:     BucketUnknown,
-			CallerType: "",
-			Caller:     "",
-		}
-		result = append(result, um)
+const attributionWorkers = 8
+
+const attributionWindow = 90*24*time.Hour - time.Hour
+
+func StageC(ctx context.Context, c *armClient, subscriptionID string, resources []Resource, maxAttribute int) ([]UnmanagedResource, error) {
+	result := make([]UnmanagedResource, len(resources))
+	if len(resources) == 0 {
+		return result, nil
 	}
-	return result
+
+	created, err := fetchCreatedTimes(ctx, c, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	resources = slices.Clone(resources)
+	slices.SortStableFunc(resources, func(a, b Resource) int {
+		return created[normalizeID(b.ID)].Compare(created[normalizeID(a.ID)])
+	})
+
+	now := time.Now()
+	since := now.Add(-attributionWindow)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, attributionWorkers)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	for i, res := range resources {
+		result[i] = UnmanagedResource{Resource: res}
+		createdAt := created[normalizeID(res.ID)]
+		switch {
+		case i >= maxAttribute:
+			result[i].Bucket = BucketNotAttempted
+		case !createdAt.IsZero() && createdAt.Before(since):
+			result[i].Bucket = BucketUnknown
+		default:
+			wg.Add(1)
+			go func(u *UnmanagedResource) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if err := findCreator(ctx, c, subscriptionID, u, since, now); err != nil {
+					once.Do(func() { firstErr = err; cancel() })
+				}
+			}(&result[i])
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return result, nil
 }
+
+func fetchCreatedTimes(ctx context.Context, c *armClient, subscriptionID string) (map[string]time.Time, error) {
+	created := make(map[string]time.Time)
+	next := "/subscriptions/" + subscriptionID + "/resources?$expand=createdTime&api-version=2021-04-01"
+	for next != "" {
+		var page struct {
+			Value []struct {
+				ID          string    `json:"id"`
+				CreatedTime time.Time `json:"createdTime"`
+			} `json:"value"`
+			NextLink string `json:"nextLink"`
+		}
+		if err := c.do(ctx, "GET", next, nil, &page); err != nil {
+			return nil, fmt.Errorf("creation times: %w", err)
+		}
+		for _, r := range page.Value {
+			if !r.CreatedTime.IsZero() {
+				created[normalizeID(r.ID)] = r.CreatedTime
+			}
+		}
+		next = page.NextLink
+	}
+	return created, nil
+}
+
+func findCreator(ctx context.Context, c *armClient, subscriptionID string, u *UnmanagedResource, since, now time.Time) error {
+	q := url.Values{}
+	q.Set("api-version", "2015-04-01")
+	q.Set("$filter", fmt.Sprintf("eventTimestamp ge '%s' and eventTimestamp le '%s' and resourceUri eq '%s'",
+		since.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339), u.ID))
+	q.Set("$select", "caller,eventTimestamp,operationName,status")
+	next := "/subscriptions/" + subscriptionID + "/providers/Microsoft.Insights/eventtypes/management/values?" + q.Encode()
+	createOp := u.Type + "/write"
+
+	for next != "" {
+		var page struct {
+			Value []struct {
+				Caller         string    `json:"caller"`
+				EventTimestamp time.Time `json:"eventTimestamp"`
+				OperationName  struct {
+					Value string `json:"value"`
+				} `json:"operationName"`
+				Status struct {
+					Value string `json:"value"`
+				} `json:"status"`
+			} `json:"value"`
+			NextLink string `json:"nextLink"`
+		}
+		if err := c.do(ctx, "GET", next, nil, &page); err != nil {
+			return fmt.Errorf("activity log for %s: %w", u.ID, err)
+		}
+		for _, e := range page.Value {
+			if e.Status.Value != "Succeeded" || !strings.EqualFold(e.OperationName.Value, createOp) {
+				continue
+			}
+			if u.EventTime == nil || e.EventTimestamp.Before(*u.EventTime) {
+				t := e.EventTimestamp
+				u.Caller, u.EventTime = e.Caller, &t
+			}
+		}
+		next = page.NextLink
+	}
+	return nil
+}
+
+var guidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$`)
 
 func StageT(resources []UnmanagedResource) []UnmanagedResource {
 	for i := range resources {
-		if resources[i].Caller == "" {
-			resources[i].Bucket = BucketUnknown
-		} else if isEmail(resources[i].Caller) {
-			resources[i].CallerType = CallerTypePerson
-			resources[i].Bucket = BucketReview
-		} else {
-			resources[i].CallerType = CallerTypeSP
-			resources[i].Bucket = BucketLikelyOtherIaC
+		r := &resources[i]
+		switch {
+		case r.Bucket != "":
+		case r.Caller == "":
+			r.Bucket = BucketUnknown
+		case strings.Contains(r.Caller, "@"):
+			r.CallerType, r.Bucket = CallerTypePerson, BucketReview
+		case guidPattern.MatchString(r.Caller):
+			r.CallerType, r.Bucket = CallerTypeSP, BucketLikelyOtherIaC
+		default:
+			r.Bucket = BucketLikelyOtherIaC
 		}
 	}
 	return resources
-}
-
-func isEmail(s string) bool {
-	return strings.Contains(s, "@")
 }
