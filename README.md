@@ -17,7 +17,7 @@ tfstray never writes to your subscription or your state.
  
 - **Unmanaged inventory** - every top-level resource and resource group in the subscription, diffed against one or more state files. Terraform `data` blocks count as *not* owned.
 - **IaC coverage** - one number, `in state / scanned`, so you can watch it improve over time.
-- **Platform suppression** - built-in rules for resources Azure creates on your behalf (`MC_*`, `NetworkWatcherRG`, ...), plus your own `.tfstrayignore`. Suppressed rows are always counted, never silently hidden.
+- **Platform suppression** - built-in rules for resources Azure creates on your behalf (`MC_*`, `NetworkWatcherRG`, ...), plus your own `--ignore` patterns or a `.tfstrayignore` file. Suppressed rows are always counted, never silently hidden.
 - **Attribution** - the creator of each unmanaged resource, from the Activity Log.
 - **Triage** - created by a person → `REVIEW`; by a service principal → `LIKELY OTHER IaC`; no record → `UNKNOWN`.
 - **CI-friendly** - JSON on stdout, logs on stderr, and exit codes that tell "found problems" apart from "could not run".
@@ -49,10 +49,18 @@ terraform show -json | tfstray scan --subscription <id> --state -
  
 ```
 Scanned 312 | in state: 256 | unmanaged: 56 | coverage: 82%
- 
-  disk-test-old      Compute/disks       rg-app
-  st0accountlogs     Storage/accounts    rg-logs
-  rg-legacy-billing  Resources/groups    -
+suppressed: 9 (built-in: 7, user rules: 2)
+
+REVIEW (19) - created by a person
+  disk-test-old      compute/disks             rg-app  alice@contoso.com
+  rg-legacy-billing  resources/resourcegroups  -       bob@contoso.com
+  ...
+
+LIKELY_OTHER_IAC (22) - created by a service principal or the platform
+  st0accountlogs  storage/storageaccounts  rg-logs  11111111-2222-3333-4444-555555555555
+  ...
+
+UNKNOWN (6) - no creation event in the last 90 days
   ...
 ```
  
@@ -67,10 +75,10 @@ Scanned 312 | in state: 256 | unmanaged: 56 | coverage: 82%
                  difference: not in any state
                           │
                           ▼
-                 suppress platform-created      (planned)
+                 suppress platform-created
                           │
                           ▼
-                 Activity Log: who created it   (planned)
+                 Activity Log: who created it
                           │
                           ▼
                  REVIEW / LIKELY OTHER IaC / UNKNOWN
@@ -84,7 +92,7 @@ Attribution only queries resources that survive the diff, so runtime tracks the 
 | Code | Meaning |
 | --- | --- |
 | 0 | Ran successfully |
-| 1 | Ran successfully, `--fail-on` threshold crossed *(planned)* |
+| 1 | Ran successfully, `--fail-on` threshold crossed |
 | 2 | Could not run: auth failure, bad state file, API error, bad flags |
  
 ## Known limitations

@@ -1,5 +1,5 @@
-tfstray
-tfstray.exe
+/tfstray
+/tfstray.exe
 *.tfstate
 *.tfstate.*
 dist/

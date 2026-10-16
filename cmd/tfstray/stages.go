@@ -277,8 +277,6 @@ func StageD(inventory []Resource, managed map[string]bool) []Resource {
 	return unmanaged
 }
 
-// suppressRule matches one field ("rg" or "type") for a built-in rule. A user
-// rule has no field and matches resource group, type, or full ID.
 type suppressRule struct {
 	pattern string
 	field   string
@@ -292,9 +290,6 @@ var defaultDenyList = []suppressRule{
 	{"microsoft.network/networkwatchers", "type"},
 }
 
-// suppressionRules returns the built-in rules (unless disabled), then --ignore
-// patterns, then .tfstrayignore lines. A missing ignore file is not an error;
-// a malformed pattern is.
 func suppressionRules(ignore []string, ignoreFile string, noDefaults bool) ([]suppressRule, error) {
 	var rules []suppressRule
 	if !noDefaults {
@@ -341,8 +336,6 @@ func StageS(resources []Resource, rules []suppressRule) ([]Resource, []Suppresse
 	return kept, suppressed
 }
 
-// matchRule returns the first matching rule. Matching is case-insensitive, and
-// path.Match keeps * from crossing /.
 func matchRule(res Resource, rules []suppressRule) (suppressRule, bool) {
 	for _, r := range rules {
 		pattern := strings.ToLower(r.pattern)

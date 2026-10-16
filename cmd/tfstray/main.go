@@ -1,14 +1,18 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -29,7 +33,7 @@ func main() {
 	case "scan":
 		os.Exit(cmdScan(args))
 	case "version":
-		fmt.Println("tfstray version 0.1.0")
+		fmt.Println(versionString())
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
@@ -45,7 +49,7 @@ Usage:
 
 Commands:
   scan      List unmanaged resources
-  version   Print version
+  version   Print version and commit
 
 Examples:
   tfstray scan --subscription 1234-abcd --state prod.tfstate
@@ -177,7 +181,7 @@ Flags:
 	kept, suppressed := StageS(unmanaged, rules)
 	fmt.Fprintf(os.Stderr, "Suppressed %d resources\n", len(suppressed))
 
-	fmt.Fprintf(os.Stderr, "Attributing %d resources...\n", min(len(kept), maxAttribute))
+	fmt.Fprintf(os.Stderr, "Attributing up to %d resources...\n", min(len(kept), maxAttribute))
 	attributed, err := StageC(ctx, client, subscription, kept, maxAttribute)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stage C failed: %v\n", err)
@@ -202,7 +206,7 @@ Flags:
 		data, _ := json.MarshalIndent(output, "", "  ")
 		fmt.Println(string(data))
 	} else {
-		printText(output)
+		printText(os.Stdout, output)
 	}
 
 	if failCrossed(triaged) {
@@ -259,43 +263,75 @@ func summarize(scanned, unmanaged int, suppressed []SuppressedResource) Summary 
 	return s
 }
 
-func printText(output Output) {
-	fmt.Printf("Subscription: %s\n", output.Subscription)
-	fmt.Printf("Coverage: %.1f%% (%d in state, %d total)\n",
-		output.Summary.Coverage*100, output.Summary.InState, output.Summary.Scanned)
-	sup := output.Summary.Suppressed
-	fmt.Printf("Unmanaged: %d (suppressed: %d (built-in: %d, user rules: %d))\n\n",
-		output.Summary.Unmanaged, sup.Total, sup.BuiltIn, sup.User)
+func printText(w io.Writer, output Output) {
+	sum := output.Summary
+	fmt.Fprintf(w, "Scanned %d | in state: %d | unmanaged: %d | coverage: %.0f%%\n",
+		sum.Scanned, sum.InState, sum.Unmanaged, sum.Coverage*100)
+	fmt.Fprintf(w, "suppressed: %d (built-in: %d, user rules: %d)\n",
+		sum.Suppressed.Total, sum.Suppressed.BuiltIn, sum.Suppressed.User)
 
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	sections := []struct{ bucket, title string }{
-		{BucketReview, "REVIEW (created by a person)"},
-		{BucketLikelyOtherIaC, "LIKELY_OTHER_IAC (created by a service principal or the platform)"},
-		{BucketUnknown, "UNKNOWN (no creation event in the last 90 days)"},
-		{BucketNotAttempted, "NOT_ATTEMPTED (beyond -max-attribute)"},
+		{BucketReview, "created by a person"},
+		{BucketLikelyOtherIaC, "created by a service principal or the platform"},
+		{BucketUnknown, "no creation event in the last 90 days"},
+		{BucketNotAttempted, "beyond -max-attribute"},
 	}
 	for _, sec := range sections {
-		fmt.Printf("%s:\n", sec.title)
-		count := 0
-		for _, res := range output.Resources {
-			if res.Bucket != sec.bucket {
-				continue
+		var rows []UnmanagedResource
+		for _, r := range output.Resources {
+			if r.Bucket == sec.bucket {
+				rows = append(rows, r)
 			}
-			fmt.Printf("  %s (%s)\n", res.Name, res.Type)
-			if res.Caller != "" {
-				fmt.Printf("    creator: %s\n", res.Caller)
-			}
-			count++
 		}
-		if count == 0 {
-			fmt.Println("  (none)")
+		if len(rows) == 0 {
+			continue
 		}
-		fmt.Println()
+		fmt.Fprintf(tw, "\n%s (%d) - %s\n", sec.bucket, len(rows), sec.title)
+		for _, r := range rows {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", r.Name, shortType(r.Type), groupColumn(r.Resource), cmp.Or(r.Caller, "-"))
+		}
+	}
+	if len(output.Resources) == 0 {
+		fmt.Fprintln(tw, "\nNothing left to review after suppression.")
 	}
 
 	if len(output.Suppressed) > 0 {
-		fmt.Printf("Suppressed (%d):\n", len(output.Suppressed))
-		for _, res := range output.Suppressed {
-			fmt.Printf("  %s (%s)\n    rule: %s\n", res.Name, res.Type, res.Rule)
+		fmt.Fprintf(tw, "\nSUPPRESSED (%d)\n", len(output.Suppressed))
+		for _, r := range output.Suppressed {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\trule: %s\n", r.Name, shortType(r.Type), groupColumn(r.Resource), r.Rule)
 		}
 	}
+	tw.Flush()
+}
+
+func shortType(t string) string {
+	provider, rest, _ := strings.Cut(strings.TrimPrefix(t, "microsoft."), "/")
+	return provider + "/" + rest[strings.LastIndex(rest, "/")+1:]
+}
+
+func groupColumn(r Resource) string {
+	if r.Type == "microsoft.resources/subscriptions/resourcegroups" {
+		return "-"
+	}
+	return r.ResourceGroup
+}
+
+// version is set by GoReleaser via -ldflags; empty for go install / go build.
+var version string
+
+func versionString() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "tfstray unknown"
+	}
+	v := "tfstray " + cmp.Or(version, strings.Trim(info.Main.Version, "()"), "unknown")
+	vcs := map[string]string{}
+	for _, s := range info.Settings {
+		vcs[s.Key] = s.Value
+	}
+	if rev := vcs["vcs.revision"]; rev != "" {
+		v += fmt.Sprintf(" (commit %s, committed %s)", rev[:min(7, len(rev))], vcs["vcs.time"])
+	}
+	return v
 }
